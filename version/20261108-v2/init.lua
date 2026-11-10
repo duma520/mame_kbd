@@ -1,0 +1,1194 @@
+-- license:BSD-3-Clause
+-- copyright-holders:local
+--
+-- MAME 0.289 插件 mame_kbd —— 当前 ROM 的 1P~4P 按键对照表
+--
+-- 用途：把运行中游戏的方向键、选择、开始、以及按键 1~N 各自绑定了哪个真实按键，
+--       在画面下方以「P1 / P2 / P3 / P4 四列」实时显示，玩家按下时该项变色高亮。
+--
+-- 数据来源（全部走官方 Lua API，不读 cfg、不硬编码 IPT_ 枚举数值）：
+--   1) 遍历 ioport.ports[tag].fields，用 ioport:input_type_to_token(type, player)
+--      拿到 "P1_JOYSTICK_UP" / "P1_BUTTON1" / "START1" 这类 token，
+--      再从 token 解析「玩家号 + 语义」（不用枚举数值，MAME 改枚举也不受影响）。
+--      注意：START1/COIN1 这类 token 的 field.player 恒为 0，玩家号必须取自 token。
+--   2) 单个输入最终生效的绑定按三级回退取：
+--      field:input_seq('standard')      → 本游戏单独覆盖
+--      field:default_input_seq()        → 字段默认（未覆盖时即通用分配）
+--      ioport:type_seq(type, player)    → 通用输入分配
+--   3) 显示文本用 input:seq_name(seq)，由 MAME 自己生成，自动跟随语言设置。
+--   4) 按下判定：读 port:read() 与 field.mask 做按位与，和 field.defvalue 比较
+--      （MAME 的 ioport 是低有效：未按下该位为 1，按下为 0）。
+--
+-- 布局（每列内）：
+--     第 1 行  方向键 U / D / L / R  —— 固定 4 格
+--     第 2 行  选择 / 开始          —— 有才显示
+--     之后     按键 1..N            —— 只渲染游戏真实存在的字段
+--              按钮数 2~4  → 每行 1 个
+--              按钮数 5~6  → 每行 2 个
+--              按钮数 7 以上 → 每行 3 个
+--
+-- 绘制：register_frame_done 里往 manager.machine.render.ui_container 画
+--       （坐标 0..1 归一化，(0,0)=左上、(1,1)=右下）。
+--
+-- 持久化：按 ROM 分别保存，互不污染。
+--       <插件目录>/settings_<rom>.ini（当前 ROM 的设置）
+--       <插件目录>/settings_default.ini（无 ROM 时的默认值）
+--       插件目录不可写时回退 <homepath>/mame_kbd/
+
+local exports = {
+	name = 'mame_kbd',
+	version = '2.1.0',
+	description = 'Show P1-P4 direction/select/start/button key bindings at the bottom of the screen',
+	license = 'BSD-3-Clause',
+	author = { name = 'local' } }
+
+local mame_kbd = exports
+
+local frame_subscription, reset_subscription, stop_subscription
+local plugin_folder = nil
+
+-- ============================================================
+-- 位运算辅助（Lua 5.1 没有 & | << >>，必须用算术模拟）
+-- ============================================================
+local function band(a, b)
+	a = math.floor(tonumber(a) or 0)
+	b = math.floor(tonumber(b) or 0)
+	local r, bit = 0, 1
+	while a > 0 and b > 0 do
+		if a % 2 == 1 and b % 2 == 1 then r = r + bit end
+		a = math.floor(a / 2)
+		b = math.floor(b / 2)
+		bit = bit * 2
+	end
+	return r
+end
+
+local function safe(fn, default)
+	local ok, v = pcall(fn)
+	if ok and v ~= nil then return v end
+	return default
+end
+
+local function clamp_int(v, lo, hi, default)
+	local n = tonumber(v)
+	if not n then return default end
+	n = math.floor(n)
+	if n < lo then n = lo end
+	if n > hi then n = hi end
+	return n
+end
+
+-- ============================================================
+-- 语义与 token 解析
+-- ============================================================
+local DIR_ORDER = { 'UP', 'DOWN', 'LEFT', 'RIGHT' }
+local DIR_SET = { UP = true, DOWN = true, LEFT = true, RIGHT = true }
+local MAX_BUTTON = 16
+
+-- 从 ioport token 解析出 (玩家索引 0 基, 类别, 语义键)
+--   "P1_JOYSTICK_UP" -> 0, 'DIR',    'UP'
+--   "P1_UP"          -> 0, 'DIR',    'UP'
+--   "P1_BUTTON3"     -> 0, 'BUTTON', 'BUTTON3'
+--   "START1"         -> 0, 'START',  'START'
+--   "SELECT2"        -> 1, 'SELECT', 'SELECT'
+local function parse_token(tok)
+	if not tok then return nil end
+	tok = tostring(tok)
+
+	local p, dir = tok:match('^P(%d+)_JOYSTICK_(%u+)$')
+	if p and DIR_SET[dir] then
+		return tonumber(p) - 1, 'DIR', dir
+	end
+
+	local p2, dir2 = tok:match('^P(%d+)_(%u+)$')
+	if p2 and DIR_SET[dir2] then
+		return tonumber(p2) - 1, 'DIR', dir2
+	end
+
+	local p3, btn = tok:match('^P(%d+)_BUTTON(%d+)$')
+	if p3 and btn then
+		return tonumber(p3) - 1, 'BUTTON', 'BUTTON' .. tostring(tonumber(btn))
+	end
+
+	local s = tok:match('^START(%d+)$')
+	if s then return tonumber(s) - 1, 'START', 'START' end
+
+	local sel = tok:match('^SELECT(%d+)$')
+	if sel then return tonumber(sel) - 1, 'SELECT', 'SELECT' end
+
+	return nil
+end
+
+-- 过滤说明：不再按 type_class 黑名单过滤。
+-- 原因（实测 119 得到的真实数据）：START1/START2/COIN1/COIN2/SERVICE1 的
+-- type_class 都是 misc，若照 copilot2p 那样把 misc 排除，就永远拿不到「开始」。
+-- 改为：只认 parse_token 解析成功的白名单 token（DIR/BUTTON/START/SELECT），
+-- 其余 token（COIN/SERVICE/DIPSWITCH/…）自然被丢弃，无需再套黑名单。
+
+-- ============================================================
+-- 设置（按 ROM 分别持久化）
+-- ============================================================
+local function default_settings()
+	return {
+		show = true,             -- 是否显示
+		layout = 'four',         -- 'four' = 固定四列（P3/P4 无输入时显示「无」）；'auto' = 只显示有输入的玩家
+		label = 'zh',            -- 'zh' = 中文标签；'ascii' = U/D/L/R
+		per_row = 'auto',        -- 'auto' = 按按钮数自适应；1/2/3 = 强制每行格数
+		show_start = true,       -- 显示「选择 / 开始」行
+		highlight = true,        -- 按下时变色高亮
+		seq_mode = 'first',      -- 'first' = 只显示第一个绑定；'full' = 显示全部（or 连接）
+		line_px = 24,            -- 行距（像素）
+		bottom_px = 28,          -- 距画面底部边距（像素）；draw_text 的 y 是基线，需留出降部空间
+		col_px = 6,              -- 列间空隙（像素）
+		bg_alpha = 200,          -- 背景不透明度 0..255
+		char_px = 15,            -- UI 字体半角字符宽度（像素）。实测（1351px 窗口一行四列）：Down=65px/4字、1:Right Ctrl=235px/12字，平均约 16px；取 15 略保守，配合多词缩写（Num 8->N8）后 5 字可过、6 字截断
+
+	}
+end
+
+local settings = default_settings()
+
+local function home_dir()
+	return safe(function()
+		return manager.options.entries.homepath:value():match('([^;]+)')
+	end, nil)
+end
+
+local function current_rom()
+	local name = safe(function() return manager.machine.system.name end, nil)
+	if name and tostring(name) ~= '' then return tostring(name) end
+	return nil
+end
+
+-- 按 ROM 名生成设置文件路径；无 ROM 时用 settings_default.ini
+local function settings_path(for_write)
+	local rom = current_rom()
+	local file
+	if rom then
+		-- ROM 名可能含路径非法字符，统一替换
+		local clean = rom:gsub('[\\/:*?"<>|]', '_')
+		file = 'settings_' .. clean .. '.ini'
+	else
+		file = 'settings_default.ini'
+	end
+	if plugin_folder and plugin_folder ~= '' then
+		return plugin_folder .. '/' .. file
+	end
+	if for_write then return nil end
+	return nil
+end
+
+local function fallback_dir()
+	local home = home_dir()
+	if home and home ~= '' then return home .. '/mame_kbd' end
+	return nil
+end
+
+local function serialize()
+	local t = {}
+	t[#t + 1] = 'show=' .. (settings.show and '1' or '0')
+	t[#t + 1] = 'layout=' .. tostring(settings.layout)
+	t[#t + 1] = 'label=' .. tostring(settings.label)
+	t[#t + 1] = 'per_row=' .. tostring(settings.per_row)
+	t[#t + 1] = 'show_start=' .. (settings.show_start and '1' or '0')
+	t[#t + 1] = 'highlight=' .. (settings.highlight and '1' or '0')
+	t[#t + 1] = 'seq_mode=' .. tostring(settings.seq_mode)
+	t[#t + 1] = 'line_px=' .. tostring(settings.line_px)
+	t[#t + 1] = 'bottom_px=' .. tostring(settings.bottom_px)
+	t[#t + 1] = 'col_px=' .. tostring(settings.col_px)
+	t[#t + 1] = 'bg_alpha=' .. tostring(settings.bg_alpha)
+	t[#t + 1] = 'char_px=' .. tostring(settings.char_px)
+	return table.concat(t, '\n') .. '\n'
+end
+
+local function write_file(path, text)
+	local f = io.open(path, 'w')
+	if not f then return false end
+	f:write(text)
+	f:close()
+	return true
+end
+
+local function save_settings()
+	local body = serialize()
+	local p = settings_path(true)
+	if p and write_file(p, body) then return end
+	-- 插件目录不可写，回退到 homepath
+	local dir2 = fallback_dir()
+	if not dir2 then return end
+	pcall(function() require('lfs').mkdir(dir2) end)
+	local rom = current_rom()
+	local name = rom and ('settings_' .. rom:gsub('[\\/:*?"<>|]', '_') .. '.ini') or 'settings_default.ini'
+	write_file(dir2 .. '/' .. name, body)
+end
+
+local function apply_kv(cfg, k, v)
+	if k == 'show' then
+		cfg.show = (v == '1' or v == 'true')
+	elseif k == 'layout' then
+		if v == 'four' or v == 'auto' then cfg.layout = v end
+	elseif k == 'label' then
+		if v == 'ascii' or v == 'zh' then cfg.label = v end
+	elseif k == 'per_row' then
+		if v == 'auto' then
+			cfg.per_row = 'auto'
+		else
+			local n = tonumber(v)
+			if n == 1 or n == 2 or n == 3 then cfg.per_row = n end
+		end
+	elseif k == 'show_start' then
+		cfg.show_start = (v == '1' or v == 'true')
+	elseif k == 'highlight' then
+		cfg.highlight = (v == '1' or v == 'true')
+	elseif k == 'seq_mode' then
+		if v == 'full' or v == 'first' then cfg.seq_mode = v end
+	elseif k == 'line_px' then
+		cfg.line_px = clamp_int(v, 10, 64, cfg.line_px)
+	elseif k == 'bottom_px' then
+		cfg.bottom_px = clamp_int(v, 0, 200, cfg.bottom_px)
+	elseif k == 'col_px' then
+		cfg.col_px = clamp_int(v, 0, 64, cfg.col_px)
+	elseif k == 'bg_alpha' then
+		cfg.bg_alpha = clamp_int(v, 0, 255, cfg.bg_alpha)
+	elseif k == 'char_px' then
+		cfg.char_px = clamp_int(v, 4, 32, cfg.char_px)
+	end
+end
+
+local function read_into(cfg, path)
+	local f = io.open(path, 'r')
+	if not f then return false end
+	local text = f:read('*a')
+	f:close()
+	if not text then return false end
+	for line in text:gmatch('[^\r\n]+') do
+		local k, v = line:match('^%s*([%w_]+)%s*=%s*(.-)%s*$')
+		if k and v then apply_kv(cfg, k, v) end
+	end
+	return true
+end
+
+local function load_settings()
+	local cfg = default_settings()
+
+	-- 先读默认，再读本 ROM 覆盖
+	local dir2 = fallback_dir()
+	local ok_any = false
+
+	local p_def = plugin_folder and (plugin_folder .. '/settings_default.ini') or nil
+	if p_def and read_into(cfg, p_def) then ok_any = true end
+	if dir2 and read_into(cfg, dir2 .. '/settings_default.ini') then ok_any = true end
+
+	local p_rom = settings_path(false)
+	if p_rom and read_into(cfg, p_rom) then ok_any = true end
+	local rom = current_rom()
+	if dir2 and rom then
+		local name = 'settings_' .. rom:gsub('[\\/:*?"<>|]', '_') .. '.ini'
+		if read_into(cfg, dir2 .. '/' .. name) then ok_any = true end
+	end
+
+	settings = cfg
+	return ok_any
+end
+
+-- ============================================================
+-- 采集
+-- ============================================================
+-- items[pl] = 有序数组，元素 { kind, sem, field, ty, port, mask, defvalue, text }
+-- present[pl] = true 表示该玩家有任何可操作字段
+local items = {}
+local present = {}
+
+local dumped = false
+
+local function dump_tokens(ioport, ports)
+	if dumped then return end
+	dumped = true
+	local n = 0
+	for tag, port in pairs(ports) do
+		local fields = safe(function() return port.fields end, nil)
+		if fields then
+			for fname, f in pairs(fields) do
+				n = n + 1
+				if n > 80 then return end
+				local pl = safe(function() return f.player end, -1)
+				local ty = safe(function() return f.type end, -1)
+				local tok = safe(function() return ioport:input_type_to_token(ty, pl) end, '?')
+				emu.print_verbose(string.format('[mame_kbd][dump] %s.%s pl=%s ty=%s tok=%s',
+					tostring(tag), tostring(fname), tostring(pl), tostring(ty), tostring(tok)))
+			end
+		end
+	end
+end
+
+-- 精简绑定显示名，用于窄格子（一行四列时每格只有约 80px）。
+-- MAME 的 code_name 形如 "Kbd Up" / "Kbd Ctrl" / "Joy 2 Up" / "Joy 1 Start"，
+-- 其中 "Kbd " 前缀对键盘按键毫无信息量，占掉 5 个字符位，必须去掉；
+-- 手柄则缩写为 J1/J2 以便仍能区分。
+-- 注意：必须定义在 seq_text 之前（Lua 的 local 只在定义点之后可见）。
+local ABBR = {
+	CONTROL = 'Ctrl', CTRL = 'Ctrl', SHIFT = 'Shift', ALT = 'Alt', SPACE = 'Spc',
+	ENTER = 'Ent', RETURN = 'Ent', ESCAPE = 'Esc', BACKSPACE = 'Bksp', TAB = 'Tab',
+	NUMPAD = 'Num', NUM = 'Num', PAD = 'Num', DELETE = 'Del', INSERT = 'Ins',
+	HOME = 'Home', END = 'End', PAGEUP = 'PgUp', PAGEDOWN = 'PgDn',
+	LSHIFT = 'LShift', RSHIFT = 'RShift', LCTRL = 'LCtrl', RCTRL = 'RCtrl',
+	LALT = 'LAlt', RALT = 'RAlt', LWIN = 'LWin', RWIN = 'RWin',
+	CAPSLOCK = 'Caps', PRINTSCREEN = 'PrtSc', SCROLLLOCK = 'Scrlk', PAUSE = 'Pause',
+	MINUS = '-', PLUS = '+', EQUALS = '=', COMMA = ',', PERIOD = '.', SLASH = '/',
+	BACKSLASH = '\\', SEMICOLON = ';', APOSTROPHE = "'", GRAVE = '`',
+	OPENBRACKET = '[', CLOSEBRACKET = ']',
+	START = 'Sta', SELECT = 'Sel',
+}
+
+-- 多词按键名压缩：MAME 对数字键盘返回 "Num 8"、"Num Enter"、"Num Del"，
+-- 手柄返回 "Joy 2 Up"。一行四列时每格只有约 82px（约 5 个半角字符），
+-- 「Num 8」占 5 字 + 空格正好卡满，四个格连排会糊成一片；「Num Enter」9 字必然截断。
+-- 因此把 "Num X" 压成 "N8"/"NEnt"，把长单词按 ABBR 缩写，既保住可辨识度又塞得下。
+local function shrink_words(t)
+	-- "Num <token>" -> "N<缩写>"（数字键盘专用，最省位）
+	t = t:gsub('^Num%s+(%S+)$', function(w)
+		local up = w:upper()
+		local a = ABBR[up]
+		if a and #a <= 2 then return 'N' .. a end
+		if up:match('^%d$') then return 'N' .. up end
+		if a then return 'N' .. a end
+		return 'Num' .. w
+	end)
+	-- 整串只有一个词时不缩写（"Down"/"Right"/"Left" 这类 4~5 字在 82px 下放得下，
+	-- 缩成 "Dn"/"Rt" 反而更难认）；只有多词时才逐词压缩，因为多词必然挤出格子。
+	local words = {}
+	for w in t:gmatch('%S+') do words[#words + 1] = w end
+	if #words <= 1 then return t end
+	local out = {}
+	for _, w in ipairs(words) do
+		local a = ABBR[w:upper()]
+		-- 未收录的词：超过 5 字才截短到 4 字，否则原样保留
+		if not a and #w > 5 then a = w:sub(1, 4) end
+		out[#out + 1] = a or w
+	end
+	return table.concat(out, ' ')
+end
+
+local function trim_binding(s)
+	if not s then return s end
+	local t = tostring(s)
+	t = t:gsub('^Kbd%s+', '')
+	t = t:gsub('^Joy%s+(%d+)%s+', function(n) return 'J' .. n .. ' ' end)
+	t = t:gsub('^Joy%s+', 'J ')
+	t = shrink_words(t)
+	return t
+end
+
+local function seq_name_of(seq)
+	if not seq then return nil end
+	local input = manager and manager.machine and manager.machine.input
+	if not input then return nil end
+	local ok, s = pcall(function() return input:seq_name(seq) end)
+	if not ok or s == nil then return nil end
+	s = tostring(s)
+	if s == '' or s == 'None' or s == 'none' then return nil end
+	return s
+end
+
+-- 只取序列里第一个绑定的显示名。
+-- 为什么需要它：MAME 一个 field 的默认绑定常是「键盘 Up 或 手柄1上 或 摇杆…」的复合序列，
+-- input:seq_name() 会把整串拼出来（实测形如 "Kbd Up or Joy 2 Up or Kbd F or …"），
+-- 塞进一格必然溢出。这里用 seq_to_tokens 拿第一个 token，再翻成显示名。
+local function first_binding_name(seq)
+	if not seq then return nil end
+	local input = manager and manager.machine and manager.machine.input
+	if not input then return nil end
+	local toks = safe(function() return input:seq_to_tokens(seq) end, nil)
+	if not toks then return nil end
+	toks = tostring(toks)
+	local first = toks:match('^(%S+)')
+	if not first or first == '' then return nil end
+	local code = safe(function() return input:code_from_token(first) end, nil)
+	if code ~= nil and code ~= 0 then
+		local nm = safe(function() return input:code_name(code) end, nil)
+		if nm and tostring(nm) ~= '' then return tostring(nm) end
+	end
+	-- 兜底：直接把 token 去掉前缀当名字
+	return (first:gsub('^KEYCODE_', ''):gsub('^JOYCODE_', 'Joy'))
+end
+
+-- 单个 field 最终生效的绑定文本（三级回退）
+DBG_EMPTY = 0
+DBG_NAMED = 0
+DBG_ITEMS = 0
+local function seq_text(f, ty, pl)
+	local seq = safe(function() return f:input_seq('standard') end, nil)
+	local dbg_first = seq
+	if not (seq and not safe(function() return seq.empty end, false)) then
+		seq = nil
+	end
+	if not seq then
+		local dseq = safe(function() return f:default_input_seq('standard') end, nil)
+		if dseq and not safe(function() return dseq.empty end, false) then
+			seq = dseq
+		end
+	end
+	if not seq and ty then
+		local ioport = manager and manager.machine and manager.machine.ioport
+		if ioport then
+			local tseq = safe(function() return ioport:type_seq(ty, pl) end, nil)
+			if tseq and not safe(function() return tseq.empty end, false) then
+				seq = tseq
+			end
+		end
+	end
+	-- 诊断：只在 seq 为空时打印一次每项的中间状态，定位为什么拿不到绑定文本
+	if not seq then
+		DBG_EMPTY = DBG_EMPTY + 1
+		if DBG_EMPTY <= 24 then
+			local t1 = safe(function() return tostring(dbg_first) end, 'nil')
+			local e1 = safe(function() return tostring(dbg_first and dbg_first.empty) end, 'nil')
+			local t2 = safe(function() return tostring(f:default_input_seq('standard')) end, 'nil')
+			local t3 = safe(function() return tostring(manager.machine.ioport:type_seq(ty, pl)) end, 'nil')
+			emu.print_info(string.format('[mame_kbd][seqnil] %s ty=%s pl=%s first=%s first.empty=%s def=%s typeseq=%s',
+				tostring(safe(function() return f.name end, '?')), tostring(ty), tostring(pl), t1, e1, t2, t3))
+		end
+		return nil
+	end
+
+	if settings.seq_mode == 'full' then
+		local full = seq_name_of(seq)
+		-- 全部绑定模式下仍去掉 "Kbd " 前缀，否则更挤
+		return full and trim_binding(full) or nil
+	end
+	local nm = first_binding_name(seq) or seq_name_of(seq)
+	-- 诊断：seq 有值但取不出名字时，把中间量打出来（xmen 就是这种情况）
+	if not nm then
+		DBG_NAMED = DBG_NAMED + 1
+		if DBG_NAMED <= 24 then
+			local input = safe(function() return manager.machine.input end, nil)
+			local toks = input and safe(function() return input:seq_to_tokens(seq) end, nil)
+			local len = safe(function() return seq.length end, nil)
+			local snake = input and safe(function() return input:seq_name(seq) end, nil)
+			emu.print_info(string.format('[mame_kbd][seqnoname] %s ty=%s pl=%s len=%s toks=%s seq_name=%s',
+				tostring(safe(function() return f.name end, '?')), tostring(ty), tostring(pl),
+				tostring(len), tostring(toks), tostring(snake)))
+		end
+		return nil
+	end
+	return trim_binding(nm)
+end
+
+-- 某个 field 当前是否被按下
+local function field_pressed(item)
+	-- 首选官方 API：ioport:type_pressed(type, player) 直接返回该输入类型当前是否按下。
+	-- 这是 MAME 自己维护的状态，不依赖 ioport 的有效电平约定，是最可靠的一路。
+	local ioport = safe(function() return manager.machine.ioport end, nil)
+	if ioport and item.ty then
+		local ok, pressed = pcall(function() return ioport:type_pressed(item.ty, item.player) end)
+		if ok and pressed ~= nil then
+			return (pressed == true) or (tonumber(pressed) or 0) ~= 0
+		end
+	end
+	-- 回退：直接读 port 值做按位与。
+	-- 注意：实测在本机 port:read() 未按键时返回 0（而不是理论上低有效应有的全 1），
+	-- 所以这里不能写 band(v, m) == 0——那会把所有项都误判成「按下」。
+	-- 只有在与出来的位明显非零时才认为按下，宁可漏判也不误判（误判会让整块常亮）。
+	local port = item.port
+	if not port then return false end
+	local v = safe(function() return port:read() end, nil)
+	if v == nil then return false end
+	local m = item.mask
+	if not m or m == 0 then return false end
+	return band(v, m) ~= 0
+end
+
+local function rebuild_bindings()
+	items = {}
+	present = {}
+
+	local machine = manager and manager.machine
+	if not machine then return end
+	local ioport = machine.ioport
+	if not ioport then return end
+	local ports = safe(function() return ioport.ports end, nil)
+	if not ports then return end
+
+	dump_tokens(ioport, ports)
+
+	-- 收集：collected[pl][key] = item
+	local collected = {}
+
+	for tag, port in pairs(ports) do
+		local fields = safe(function() return port.fields end, nil)
+		if fields then
+			for fname, f in pairs(fields) do
+				local ty = safe(function() return f.type end, nil)
+				local analog = safe(function() return f.is_analog end, false)
+				local enabled = safe(function() return f.enabled end, false)
+				local pl_raw = safe(function() return f.player end, 0)
+
+				if ty and enabled and not analog then
+					local tok = safe(function() return ioport:input_type_to_token(ty, pl_raw) end, nil)
+					local pl, kind, sem = parse_token(tok)
+
+					-- parse_token 只在 DIR/BUTTON/START/SELECT 这四类上返回非 nil，
+					-- 因此这里天然完成了白名单过滤（COIN/SERVICE/DIP 等解析不出、自动丢弃）。
+					if pl and pl >= 0 and pl <= 3 then
+						local mask = safe(function() return f.mask end, 0)
+						local defv = safe(function() return f.defvalue end, nil)
+						local item = {
+							kind = kind,
+							sem = sem,
+							field = f,
+							ty = ty,
+							port = port,
+							mask = mask,
+							defvalue = defv,
+							player = pl,
+							field_name = tostring(fname),
+							text = seq_text(f, ty, pl),
+						}
+						collected[pl] = collected[pl] or {}
+						-- 同一玩家同一语义可能出现在多个 port，取第一个
+						if not collected[pl][sem] then
+							collected[pl][sem] = item
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- 整理成有序数组：方向 → 选择/开始 → 按键 1..16
+	for pl = 0, 3 do
+		local c = collected[pl]
+		if c then
+			local list = {}
+			for _, sem in ipairs(DIR_ORDER) do
+				if c[sem] then list[#list + 1] = c[sem] end
+			end
+			if c['SELECT'] then list[#list + 1] = c['SELECT'] end
+			if c['START'] then list[#list + 1] = c['START'] end
+			for i = 1, MAX_BUTTON do
+				local it = c['BUTTON' .. i]
+				if it then list[#list + 1] = it end
+			end
+			if #list > 0 then
+				items[pl] = list
+				present[pl] = true
+			end
+		end
+	end
+
+	local function cnt(pl)
+		local c = 0
+		local l = items[pl]
+		if l then
+			for _, it in ipairs(l) do
+				if it.kind == 'BUTTON' then c = c + 1 end
+			end
+		end
+		return c
+	end
+
+	emu.print_verbose(string.format('[mame_kbd] rebuild rom=%s P1=%d P2=%d P3=%d P4=%d 按钮数=%d/%d/%d/%d',
+		tostring(current_rom()), items[0] and #items[0] or 0, items[1] and #items[1] or 0,
+		items[2] and #items[2] or 0, items[3] and #items[3] or 0,
+		cnt(0), cnt(1), cnt(2), cnt(3)))
+
+	-- 诊断：把 P1 每一项的 kind/sem/text 打出来，用于定位「有 item 但显示 --」
+	if DBG_ITEMS < 1 then
+		DBG_ITEMS = DBG_ITEMS + 1
+		for _, it in ipairs(items[0] or {}) do
+			emu.print_info(string.format('[mame_kbd][item] P1 sem=%s kind=%s ty=%s text=%s',
+				tostring(it.sem), tostring(it.kind), tostring(it.ty), tostring(it.text)))
+		end
+	end
+end
+
+-- ============================================================
+-- 绘制
+-- ============================================================
+local C_BG = 0xC8000000          -- 半透明黑底
+local C_EDGE = 0xFF3C3C3C        -- 列边框
+local C_TITLE = 0xFF00E0FF       -- 玩家标题：亮青
+local C_DIR = 0xFFFFFF80          -- 方向：淡黄
+local C_SPECIAL = 0xFF80D0FF      -- 选择/开始：淡蓝
+local C_BTN = 0xFFE8E8E8          -- 按键：近白
+local C_NONE = 0xFF909090         -- 未绑定：灰
+local C_HL = 0xFF00FF66           -- 按下高亮：亮绿
+local C_HL_BG = 0xB0008020        -- 按下背景：暗绿半透明
+
+local LABEL_ZH = {
+	UP = '上', DOWN = '下', LEFT = '左', RIGHT = '右',
+	SELECT = '选择', START = '开始',
+}
+local LABEL_ASCII = {
+	UP = 'U', DOWN = 'D', LEFT = 'L', RIGHT = 'R',
+	SELECT = 'Sel', START = 'Sta',
+}
+
+local function sem_label(sem, kind)
+	if kind == 'DIR' or kind == 'START' or kind == 'SELECT' then
+		local tbl = (settings.label == 'zh') and LABEL_ZH or LABEL_ASCII
+		return tbl[sem] or tostring(sem)
+	end
+	-- BUTTONn
+	return tostring(sem):gsub('^BUTTON', '')
+end
+
+-- 诊断计数
+local draw_calls = 0
+local draw_errors = 0
+local last_err = nil
+local draw_ok_once = false
+local draw_frames = 0
+local lit_sig = nil      -- 上一次的「按下项签名」，只有变化才打日志
+
+local function dt(container, x, y, text, fg, bg)
+	if not text or text == '' then return end
+	local ok, err
+	if bg then
+		ok, err = pcall(function() container:draw_text(x, y, text, fg, bg) end)
+	else
+		ok, err = pcall(function() container:draw_text(x, y, text, fg) end)
+	end
+	if not ok then draw_errors = draw_errors + 1; last_err = tostring(err) end
+	draw_calls = draw_calls + 1
+end
+
+-- 估算字符串的「显示宽度」：ASCII 记 1，中日韩全角字符记 2。
+-- 不能用 #text 直接当宽度 —— UTF-8 里一个汉字占 3 字节但只占 2 个字符位。
+-- 返回每一段的 (宽度, 占用字节数)
+local function next_char(s, i)
+	local b = s:byte(i)
+	if not b then return nil end
+	if b < 0x80 then return 1, 1 end
+	if b >= 0xF0 then return 2, 4 end
+	if b >= 0xE0 then return 2, 3 end
+	return 2, 2
+end
+
+local function disp_width(s)
+	local w, i = 0, 1
+	while i <= #s do
+		local cw, adv = next_char(s, i)
+		if not cw then break end
+		w = w + cw
+		i = i + adv
+	end
+	return w
+end
+
+-- 按显示宽度截断，超出时结尾用 '..'
+local function fit(text, maxw)
+	if not text or text == '' then return '' end
+	maxw = math.floor(maxw)
+	if maxw <= 2 then return '' end
+	if disp_width(text) <= maxw then return text end
+	local kept, w, i = {}, 0, 1
+	local limit = maxw - 2
+	while i <= #text do
+		local cw, adv = next_char(text, i)
+		if not cw then break end
+		if w + cw > limit then break end
+		kept[#kept + 1] = text:sub(i, i + adv - 1)
+		w = w + cw
+		i = i + adv
+	end
+	return table.concat(kept) .. '..'
+end
+
+-- 按钮数 → 每行格数
+local function per_row_for(button_count)
+	if settings.per_row ~= 'auto' then
+		return clamp_int(settings.per_row, 1, 3, 1)
+	end
+	if button_count >= 7 then return 3 end
+	if button_count >= 5 then return 2 end
+	return 1
+end
+
+local function draw_frame()
+	if not settings.show then return end
+	local machine = manager and manager.machine
+	if not machine then return end
+	local render = machine.render
+	if not render then return end
+	local container = safe(function() return render.ui_container end, nil)
+	if not container then return end
+
+	local target = safe(function() return render.ui_target end, nil)
+	local out_w = safe(function() return target.width end, 0) or 0
+	local out_h = safe(function() return target.height end, 0) or 0
+	if out_w <= 0 then out_w = 1920 end
+	if out_h <= 0 then out_h = 1080 end
+
+	-- 决定显示哪几列
+	local cols = {}
+	for pl = 0, 3 do
+		if settings.layout == 'auto' then
+			if present[pl] then cols[#cols + 1] = pl end
+		else
+			cols[#cols + 1] = pl
+		end
+	end
+	if #cols == 0 then return end
+
+	local line_px = clamp_int(settings.line_px, 10, 64, 24)
+	local bottom_px = clamp_int(settings.bottom_px, 0, 200, 10)
+	local gap_px = clamp_int(settings.col_px, 0, 64, 6)
+	local char_px = clamp_int(settings.char_px, 4, 32, 15)
+
+	-- 逐列计算行数，取最大值决定整体高度
+	-- 方向行固定一行 4 格（用户确认这个版式没问题）。
+	-- 4 列显示时格宽可能不足（1351px 窗口下每格约 82px，「下:Down」需 91px），
+	-- 这种情况不改变版式，而是靠 dir_label() 退化到单字符标签 + 缩写绑定名来解决。
+	local col_px_w = (1 / #cols) * out_w - gap_px
+	local dir_cell_px = col_px_w / 4
+	local dir_rows_needed = 1
+
+	local col_rows = {}
+	local max_rows = 0
+	for _, pl in ipairs(cols) do
+		local list = items[pl] or {}
+		local btn = 0
+		for _, it in ipairs(list) do
+			if it.kind == 'BUTTON' then btn = btn + 1 end
+		end
+		local special = 0
+		for _, it in ipairs(list) do
+			if it.kind == 'START' or it.kind == 'SELECT' then special = special + 1 end
+		end
+		local rows = 1                                  -- 标题
+		rows = rows + dir_rows_needed                   -- 方向行（固定一行 4 格）
+		-- 选择/开始行：只要有 START 或 SELECT 之一就画（两个格子固定都画）
+		if settings.show_start and special > 0 then
+			rows = rows + 1
+		end
+		local pr = per_row_for(btn)
+		if btn > 0 then
+			rows = rows + math.ceil(btn / pr)
+		end
+		col_rows[pl] = rows
+		if rows > max_rows then max_rows = rows end
+	end
+	if max_rows <= 0 then return end
+
+	-- 纵向放不下时压缩行距
+	local avail = out_h - bottom_px - 8
+	if max_rows * line_px > avail then
+		line_px = math.max(10, math.floor(avail / max_rows))
+	end
+	local total_px = max_rows * line_px
+	local top = 1 - (total_px + bottom_px) / out_h
+	if top < 0 then top = 0 end
+	local line_h = line_px / out_h
+
+	local n_cols = #cols
+	local col_w = 1 / n_cols
+	local gap = gap_px / out_w
+	local bg = clamp_int(settings.bg_alpha, 0, 255, 200) * 0x1000000
+
+	-- 整条背景
+	local ok_bg, err_bg = pcall(function()
+		container:draw_box(0, top, 1, top + (total_px + 4) / out_h, 0, bg)
+	end)
+	if not ok_bg then draw_errors = draw_errors + 1; last_err = 'box: ' .. tostring(err_bg) end
+
+	if not draw_ok_once then
+		draw_ok_once = true
+		emu.print_info(string.format('[mame_kbd] 首帧绘制 rom=%s out=%dx%d top=%.4f 列数=%d 行数=%d',
+			tostring(current_rom()), out_w, out_h, top, n_cols, max_rows))
+	end
+	draw_frames = draw_frames + 1
+
+	for ci, pl in ipairs(cols) do
+		local x0 = (ci - 1) * col_w + gap * 0.5
+		local x1 = ci * col_w - gap * 0.5
+		local rows_this = col_rows[pl] or 1
+		local h_col = rows_this * line_h
+
+		local ok_b, err_b = pcall(function()
+			container:draw_box(x0, top, x1, top + h_col, C_EDGE, 0x00000000)
+		end)
+		if not ok_b then draw_errors = draw_errors + 1; last_err = 'edge: ' .. tostring(err_b) end
+
+		local pad = 0.004
+		local y_cursor = 0
+
+		local function row_y()
+			-- 实测证据：draw_text 的 y 是「文字顶部」而不是基线。
+			-- （_shot4.png 里 top=0.8881/out_h=1001/4 行，末行 y≈981px 时文字下缘
+			--   被 1001px 的窗口底边切掉 —— 若 y 是基线，字顶应在 965 左右、不该被切。）
+			-- 因此按行顶 + 很小的偏移定位，底部另留一整行给字高。
+			local y = top + (y_cursor + 0.06) * line_h
+			y_cursor = y_cursor + 1
+			return y
+		end
+
+		-- 标题
+		dt(container, x0 + pad, row_y(), 'P' .. (pl + 1),
+			present[pl] and C_TITLE or C_NONE)
+
+		local list = items[pl] or {}
+
+		-- 方向行：固定一行 4 格（用户确认这个版式没问题）
+		local dir_items = {}
+		for _, it in ipairs(list) do
+			if it.kind == 'DIR' then dir_items[#dir_items + 1] = it end
+		end
+		local cell_w4 = (x1 - x0) / 4
+		local maxw4 = (cell_w4 * out_w) / char_px
+		-- 窄格时只显示绑定名、省掉「上:」前缀：
+		-- 「下:Down」需要 7 个半角宽，而 1351px 窗口 4 列时每格只有约 6.5 个半角宽，
+		-- 必然被截成「下:D..」。4 个格子的顺序是固定的（上/下/左/右）且颜色有别，
+		-- 所以省掉中文前缀后信息不丢，反而能把真正的按键名完整显示出来。
+		local dir_compact = maxw4 < 7
+		local y_dir = row_y()   -- 4 个格共用同一行，必须只推进一次
+		for c = 1, 4 do
+			local sem = DIR_ORDER[c]
+			local found = nil
+			for _, it in ipairs(dir_items) do
+				if it.sem == sem then found = it; break end
+			end
+			local cell_x = x0 + (c - 1) * cell_w4 + pad * 0.5
+			local lit = found and field_pressed(found)
+			local txt
+			if found and found.text then
+				if dir_compact then
+					txt = fit(found.text, maxw4)
+				else
+					txt = fit(sem_label(sem, 'DIR') .. ':' .. found.text, maxw4)
+				end
+			else
+				txt = fit(sem_label(sem, 'DIR') .. ':-', maxw4)
+			end
+			local fg = C_NONE
+			if found then fg = C_DIR end
+			if settings.highlight and lit then fg = C_HL end
+			dt(container, cell_x, y_dir, txt, fg, (settings.highlight and lit) and C_HL_BG or nil)
+		end
+
+		-- 选择 / 开始行：固定两格「选择」「开始」。
+		-- 为什么固定两格而不是只画存在的：用户要求第 2 行就是「选择 和 开始」，
+		-- 且 119 这类只有 START、没有 SELECT token 的 ROM 也要保持版式一致。
+		if settings.show_start then
+			local sel_it, sta_it = nil, nil
+			for _, it in ipairs(list) do
+				if it.kind == 'SELECT' then sel_it = it
+				elseif it.kind == 'START' then sta_it = it end
+			end
+			if sel_it or sta_it then
+				local cell_w2 = (x1 - x0) / 2
+				local maxw = (cell_w2 * out_w) / char_px
+				local y_sp = row_y()   -- 两个格共用同一行
+				local pair = { { it = sel_it, sem = 'SELECT' }, { it = sta_it, sem = 'START' } }
+				for c = 1, 2 do
+					local entry = pair[c]
+					local it = entry.it
+					local cell_x = x0 + (c - 1) * cell_w2 + pad * 0.5
+					local label = sem_label(entry.sem, entry.sem)
+					local txt, fg
+					if it and it.text then
+						local lit = field_pressed(it)
+						-- 标签优先，并按「只让必要的空间」逐级压缩（从好到差）：
+						--   1) 「标签:J1 Sta」原样；
+						--   2) 去掉绑定名里的空格：「标签:J1Sta」，保住标签且键名完整；
+						--   3) 只显示绑定名（格子窄到连标签都放不下时才用）。
+						-- 实测依据：两格版式每格约 164px≈11 个半角宽，
+						-- 「开始:J1 Sta」需 11 宽正好卡边界，去掉空格后 10 宽即可放下；
+						-- 直接按剩余宽度截断会得到「开始:J1 ..」，键名反而看不懂。
+						local head = label .. ':'
+						local full = head .. it.text
+						local tight = head .. (it.text:gsub('%s+', ''))
+						if disp_width(full) <= maxw then
+							txt = full
+						elseif disp_width(tight) <= maxw then
+							txt = tight
+						else
+							local room = maxw - disp_width(head)
+							if room >= 3 then
+								txt = head .. fit(it.text, room)
+							else
+								txt = fit(it.text, maxw)
+							end
+						end
+						fg = settings.highlight and lit and C_HL or C_SPECIAL
+						dt(container, cell_x, y_sp, txt, fg, (settings.highlight and lit) and C_HL_BG or nil)
+					else
+						txt = fit(label .. ':--', maxw)
+						dt(container, cell_x, y_sp, txt, C_NONE, nil)
+					end
+				end
+			end
+		end
+
+		-- 按键行
+		local btns = {}
+		for _, it in ipairs(list) do
+			if it.kind == 'BUTTON' then btns[#btns + 1] = it end
+		end
+		if #btns > 0 then
+			local pr = per_row_for(#btns)
+			local cell_w = (x1 - x0) / pr
+			local maxw = (cell_w * out_w) / char_px
+			local i = 1
+			while i <= #btns do
+				local y = row_y()
+				for c = 0, pr - 1 do
+					local it = btns[i + c]
+					if it then
+						local cell_x = x0 + c * cell_w + pad * 0.5
+						local lit = field_pressed(it)
+						local txt = fit(sem_label(it.sem, it.kind) .. ':' .. (it.text or '--'), maxw)
+						local fg = it.text and C_BTN or C_NONE
+						if settings.highlight and lit then fg = C_HL end
+						dt(container, cell_x, y, txt, fg, (settings.highlight and lit) and C_HL_BG or nil)
+					end
+				end
+				i = i + pr
+			end
+		end
+	end
+
+	-- 按下状态变化时打日志（用于验证 field_pressed 读取链路；仅状态变化才打印，避免刷屏）
+	do
+		local lit_n, lit_which = 0, {}
+		for pl = 0, 3 do
+			for _, it in ipairs(items[pl] or {}) do
+				if field_pressed(it) then
+					lit_n = lit_n + 1
+					lit_which[#lit_which + 1] = string.format('P%d.%s', pl + 1, tostring(it.sem))
+				end
+			end
+		end
+		local sig = tostring(lit_n) .. '|' .. table.concat(lit_which, ',')
+		if sig ~= lit_sig then
+			lit_sig = sig
+			emu.print_info(string.format('[mame_kbd] 帧%d 按下项=%d%s',
+				draw_frames, lit_n,
+				(#lit_which > 0) and (' [' .. table.concat(lit_which, ',') .. ']') or ''))
+		end
+	end
+
+	if draw_frames == 120 or (draw_frames > 0 and draw_frames % 300 == 0) then
+		emu.print_info(string.format('[mame_kbd] 帧%d 统计：draw_text=%d 失败=%d 最近错误=%s',
+			draw_frames, draw_calls, draw_errors, tostring(last_err or '无')))
+		-- 诊断：把 P1 每个 item 的 mask/defvalue/port:read() 都打出来。
+		-- 目的：证明「按下判定」的读取链路是通的（不是 nil / 不是恒等），
+		-- 因为本机无法可靠地向 MAME 注入键盘（截图验证过 keybd_event 不生效）。
+		for _, it in ipairs(items[0] or {}) do
+			local rv = safe(function() return it.port:read() end, nil)
+			local tp = 'ERR'
+			do
+				local ioport = safe(function() return manager.machine.ioport end, nil)
+				if ioport and it.ty then
+					local ok, v = pcall(function() return ioport:type_pressed(it.ty, it.player) end)
+					tp = ok and tostring(v) or 'ERR:' .. tostring(v)
+				end
+			end
+			emu.print_info(string.format('[mame_kbd][press] %s mask=%s def=%s read=%s cur=%s type_pressed=%s pressed=%s',
+				tostring(it.sem), tostring(it.mask), tostring(it.defvalue), tostring(rv),
+				tostring(rv and band(rv, it.mask)),
+				tp,
+				tostring(field_pressed(it))))
+		end
+	end
+end
+
+-- ============================================================
+-- 菜单
+-- ============================================================
+local last_actions = {}
+
+local function layout_text()
+	return (settings.layout == 'four') and '固定四列' or '仅实际玩家'
+end
+
+local function label_text()
+	return (settings.label == 'ascii') and 'U/D/L/R' or '中文'
+end
+
+local function per_row_text()
+	if settings.per_row == 'auto' then return '自动' end
+	return string.format('每行 %d 个', tonumber(settings.per_row) or 1)
+end
+
+local function seq_mode_text()
+	return (settings.seq_mode == 'full') and '全部绑定' or '首个绑定'
+end
+
+local function onoff(v)
+	return v and '开' or '关'
+end
+
+local function menu_items()
+	local list = {}
+	local actions = {}
+
+	local function push(label_txt, value, flags, act)
+		list[#list + 1] = { label_txt, value or '', flags or 'off' }
+		actions[#list + 1] = act
+	end
+	local function head(l, v) push(l, v, 'heading') end
+	local function disp(l, v) push(l, v, 'off') end
+	local function toggle(l, on, a) push(l, onoff(on), 'lr', a) end
+	local function adj(l, v, a) push(l, v, 'lr', a) end
+
+	head('KBN 按键对照表', '画面下方四列显示 P1~P4 绑定')
+
+	toggle('显示对照表', settings.show, { kind = 'show' })
+	adj('列布局', layout_text(), { kind = 'layout' })
+	adj('标签语言', label_text(), { kind = 'label' })
+	adj('每行按键数', per_row_text(), { kind = 'per_row' })
+	adj('绑定显示', seq_mode_text(), { kind = 'seq_mode' })
+	toggle('显示「选择/开始」', settings.show_start, { kind = 'show_start' })
+	toggle('按下高亮', settings.highlight, { kind = 'highlight' })
+	adj('行距', string.format('%d 像素', settings.line_px), { kind = 'line_px' })
+	adj('底部边距', string.format('%d 像素', settings.bottom_px), { kind = 'bottom_px' })
+	adj('列间隙', string.format('%d 像素', settings.col_px), { kind = 'col_px' })
+	adj('背景不透明度', string.format('%d / 255', settings.bg_alpha), { kind = 'bg_alpha' })
+	adj('字符宽度估计', string.format('%d 像素', settings.char_px), { kind = 'char_px' })
+
+	-- 诊断
+	local rom = current_rom() or '(无)'
+	disp('当前 ROM', rom)
+	local pc = 0
+	for pl = 0, 3 do
+		if present[pl] then pc = pc + 1 end
+	end
+	disp('检测到玩家数', string.format('%d / 4', pc))
+	for pl = 0, 3 do
+		local l = items[pl]
+		if l then
+			local btn = 0
+			for _, it in ipairs(l) do
+				if it.kind == 'BUTTON' then btn = btn + 1 end
+			end
+			disp(string.format('P%d', pl + 1), string.format('%d 项，按键 %d 个', #l, btn))
+		else
+			disp(string.format('P%d', pl + 1), '无输入')
+		end
+	end
+	disp('绘制调用 / 失败', string.format('%d / %d', draw_calls, draw_errors))
+
+	last_actions = actions
+	return list
+end
+
+local function menu_callback(index, event)
+	local a = last_actions[index]
+	if not a then return false end
+	local sel = (event == 'select')
+	local lft = (event == 'left')
+	local rgt = (event == 'right')
+	if not (sel or lft or rgt) then return false end
+
+	local k = a.kind
+	local dir = 0
+	if lft then dir = -1 elseif rgt then dir = 1 end
+
+	if k == 'show' then
+		settings.show = not settings.show
+	elseif k == 'layout' then
+		settings.layout = (settings.layout == 'four') and 'auto' or 'four'
+	elseif k == 'label' then
+		settings.label = (settings.label == 'ascii') and 'zh' or 'ascii'
+	elseif k == 'per_row' then
+		if dir == 0 then dir = 1 end
+		if settings.per_row == 'auto' then
+			settings.per_row = (dir > 0) and 1 or 3
+		else
+			local n = tonumber(settings.per_row) or 1
+			n = n + dir
+			if n < 1 or n > 3 then
+				settings.per_row = 'auto'
+			else
+				settings.per_row = n
+			end
+		end
+	elseif k == 'show_start' then
+		settings.show_start = not settings.show_start
+	elseif k == 'seq_mode' then
+		settings.seq_mode = (settings.seq_mode == 'full') and 'first' or 'full'
+		rebuild_bindings()
+	elseif k == 'highlight' then
+		settings.highlight = not settings.highlight
+	elseif k == 'line_px' then
+		if dir == 0 then dir = 1 end
+		settings.line_px = clamp_int(settings.line_px + dir * 2, 10, 64, 24)
+	elseif k == 'bottom_px' then
+		if dir == 0 then dir = 1 end
+		settings.bottom_px = clamp_int(settings.bottom_px + dir * 4, 0, 200, 10)
+	elseif k == 'col_px' then
+		if dir == 0 then dir = 1 end
+		settings.col_px = clamp_int(settings.col_px + dir * 2, 0, 64, 6)
+	elseif k == 'bg_alpha' then
+		if dir == 0 then dir = 1 end
+		settings.bg_alpha = clamp_int(settings.bg_alpha + dir * 25, 0, 255, 200)
+	elseif k == 'char_px' then
+		if dir == 0 then dir = 1 end
+		settings.char_px = clamp_int(settings.char_px + dir, 4, 32, 15)
+	else
+		return false
+	end
+
+	save_settings()
+	return true
+end
+
+-- ============================================================
+-- 生命周期
+-- ============================================================
+local function on_stop()
+	items = {}
+	present = {}
+end
+
+function mame_kbd.set_folder(dir)
+	plugin_folder = dir
+end
+
+function mame_kbd.startplugin()
+	-- 注意：此刻机器还没起来，current_rom() 返回 nil，所以这里读到的只是
+	-- settings_default.ini。真正的「按 ROM 保存的配置」必须等机器就绪后再读一次，
+	-- 见 process_frame 里的 loaded_rom 变更检测。
+	load_settings()
+
+	local frame_count = 0
+	local dirty = true
+	local loaded_rom = nil
+
+	local function process_frame()
+		frame_count = frame_count + 1
+
+		-- 机器就绪 / 换 ROM 后重新加载该 ROM 的专属配置
+		local rom = current_rom()
+		if rom ~= loaded_rom then
+			loaded_rom = rom
+			dirty = true
+			if rom then
+				load_settings()
+				emu.print_info(string.format('[mame_kbd] 载入 ROM 配置 rom=%s 显示=%s 绑定=%s',
+					rom, tostring(settings.show), tostring(settings.seq_mode)))
+			end
+		end
+
+		if dirty or (frame_count % 60 == 0) then
+			rebuild_bindings()
+			dirty = false
+		end
+	end
+
+	local function on_reset()
+		dirty = true
+	end
+
+	frame_subscription = emu.add_machine_frame_notifier(process_frame)
+	emu.register_frame_done(draw_frame)
+	reset_subscription = emu.add_machine_reset_notifier(on_reset)
+	stop_subscription = emu.add_machine_stop_notifier(on_stop)
+
+	emu.register_menu(menu_callback, menu_items, _p('plugin-mame_kbd', 'KBN 按键对照表'))
+
+	emu.print_info(string.format('[mame_kbd] v%s 已启动（ROM 就绪后再载入专属配置）', exports.version))
+end
+
+return exports

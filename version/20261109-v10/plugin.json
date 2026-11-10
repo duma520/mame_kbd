@@ -1,0 +1,10 @@
+{
+	"plugin": {
+		"name": "mame_kbd",
+		"description": "Show P1-P4 direction/select/start/button key bindings at the bottom of the screen",
+		"version": "2.8.1",
+		"author": "local",
+		"type": "plugin",
+		"start": "true"
+	}
+}
