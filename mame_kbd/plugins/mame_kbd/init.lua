@@ -23,9 +23,14 @@
 --     第 1 行  方向键 U / D / L / R  —— 固定 4 格
 --     第 2 行  选择 / 开始          —— 有才显示
 --     之后     按键 1..N            —— 只渲染游戏真实存在的字段
---              按钮数 2~4  → 每行 1 个
---              按钮数 5~6  → 每行 2 个
---              按钮数 7 以上 → 每行 3 个
+--              每行格数由「显示设置 → 每行按键数」决定：
+--                'auto' → 按当列可用宽度自适应：取「所有按键都能在一行内
+--                         完整显示」的最大格数（上限 16 个，即单玩家按键上限；
+--                         放不下就减格，降到 1 格仍放不下才交给 split_cell
+--                         换行/截断）；
+--                1..16  → 强制每行该格数
+--              注意：auto 看的是实际键名文本长度，同一 ROM 换过绑定后
+--              算出的格数可能变化，这是预期行为。
 --
 -- 绘制：register_frame_done 里往 manager.machine.render.ui_container 画
 --       （坐标 0..1 归一化，(0,0)=左上、(1,1)=右下）。
@@ -37,7 +42,7 @@
 
 local exports = {
 	name = 'mame_kbd',
-	version = '2.9.6',
+	version = '2.9.8',
 	description = 'Show P1-P4 direction/select/start/button key bindings at the bottom of the screen',
 	license = 'BSD-3-Clause',
 	author = { name = 'local' } }
@@ -84,6 +89,10 @@ end
 local DIR_ORDER = { 'UP', 'DOWN', 'LEFT', 'RIGHT' }
 local DIR_SET = { UP = true, DOWN = true, LEFT = true, RIGHT = true }
 local MAX_BUTTON = 16
+-- 「每行按键数」的上限：'auto' 自适应与手动档位（1..PER_ROW_MAX）共用这个上限。
+-- 改这里就能整体放开/收紧档位，不必逐个改判断。
+-- 16 与 MAX_BUTTON 对齐：单个玩家最多 16 个按键，再多也没有意义。
+local PER_ROW_MAX = 16
 
 -- 从 ioport token 解析出 (玩家索引 0 基, 类别, 语义键)
 --   "P1_JOYSTICK_UP" -> 0, 'DIR',    'UP'
@@ -138,7 +147,7 @@ local function default_settings()
 		show = true,             -- 是否显示
 		layout = 'four',         -- 'four' = 固定四列（P3/P4 无输入时显示「无」）；'auto' = 只显示有输入的玩家
 		label = 'zh',            -- 'zh' = 中文标签；'ascii' = U/D/L/R
-		per_row = 'auto',        -- 'auto' = 按按钮数自适应；1/2/3 = 强制每行格数
+		per_row = 'auto',        -- 'auto' = 按可用宽度自适应（完整显示前提下取最大格数，上限 16）；1..16 = 强制每行格数
 		show_start = true,       -- 显示「选择 / 开始」行
 		highlight = true,        -- 按下时变色高亮
 		seq_mode = 'first',      -- 'first' = 键盘+手柄都显示；'priority' = 手柄>键盘>鼠标 只显示最高优先级那一路；'full' = 显示全部（or 连接）
@@ -380,7 +389,10 @@ local function apply_kv(cfg, k, v)
 			cfg.per_row = 'auto'
 		else
 			local n = tonumber(v)
-			if n == 1 or n == 2 or n == 3 then cfg.per_row = n end
+			-- 白名单必须覆盖全部档位，否则手写 ini 里的 4/5/6 会被静默丢弃
+			if n and n >= 1 and n <= PER_ROW_MAX and n == math.floor(n) then
+				cfg.per_row = n
+			end
 		end
 	elseif k == 'show_start' then
 		cfg.show_start = (v == '1' or v == 'true')
@@ -1555,7 +1567,21 @@ local function split_cell(label, text, maxw)
 
 	-- 标签自己就已经超宽：标签一行、绑定名一行
 	if disp_width(head) >= maxw then
-		return { fit(head, maxw), fit(text, maxw) }
+		local l1 = fit(head, maxw)
+		local l2 = fit(text, maxw)
+		-- 格子窄到连「1:」都放不下时 fit 会返回空串，整格变成一片空白——
+		-- 那看起来像插件坏了（不是「截断」而是「什么都没有」）。
+		-- 退一步只画按键编号本身（如「1」），至少还能认出这是哪个键。
+		-- 每行 16 格这种极端档位下就是这个情况。
+		if l1 == '' and maxw >= 1 then
+			local bare = tostring(label)
+			l1 = fit(bare, maxw)
+			if l1 == '' then
+				local cw, adv = next_char(bare, 1)
+				if cw and cw <= maxw then l1 = bare:sub(1, adv) end
+			end
+		end
+		return { l1, l2 }
 	end
 
 	local words = {}
@@ -1595,14 +1621,45 @@ local function btn_rows_for(btns, pr, maxw)
 	return n
 end
 
--- 按钮数 → 每行格数
-local function per_row_for(button_count)
+-- 一个按键格能否在该宽度内「不截断」地整行显示。
+-- 判定与 split_cell 的前两步一致（原样 / 去掉绑定名里的空格），
+-- 但只认「放得下」——被 fit() 加上 '..' 的算放不下。
+local function cell_fits_one_line(label, text, maxw)
+	local head = tostring(label) .. ':'
+	text = tostring(text or '--')
+	if disp_width(head .. text) <= maxw then return true end
+	if disp_width(head .. (text:gsub('%s+', ''))) <= maxw then return true end
+	return false
+end
+
+-- 每行格数判定（高度统计与绘制必须都走这里，否则行数会算错）。
+--   'auto' → 按当列可用宽度自适应：从 2 格往大试，只要这一档里
+--            「每个按键都能单行完整显示」就继续加，一旦放不下就停在上一档。
+--            格数越多格子越窄，单调性成立，所以一旦失败可以 break。
+--            上限 min(PER_ROW_MAX, 按钮数)；最小 1 格兜底。
+--   1..16  → 强制该格数，不管放不放得下。
+-- col_w_px: 单列可用宽度（像素）；char_px: 半个字符的估算像素宽。
+local function per_row_for(btns, col_w_px, px_per_char)
+	local n = #btns
+	if n <= 0 then return 1 end
 	if settings.per_row ~= 'auto' then
-		return clamp_int(settings.per_row, 1, 3, 1)
+		return clamp_int(settings.per_row, 1, PER_ROW_MAX, 1)
 	end
-	if button_count >= 7 then return 3 end
-	if button_count >= 5 then return 2 end
-	return 1
+	local best = 1
+	local hi = math.min(PER_ROW_MAX, n)
+	for pr = 2, hi do
+		local maxw = (col_w_px / pr) / px_per_char
+		local ok = true
+		for _, it in ipairs(btns) do
+			if not cell_fits_one_line(sem_label(it.sem, it.kind), it.text or '--', maxw) then
+				ok = false
+				break
+			end
+		end
+		if not ok then break end
+		best = pr
+	end
+	return best
 end
 
 local function draw_frame()
@@ -1696,14 +1753,15 @@ local function draw_frame()
 			end
 			rows = rows + need
 		end
-		local pr = per_row_for(btn)
 		if btn > 0 then
 			local btns = {}
 			for _, it in ipairs(list) do
 				if it.kind == 'BUTTON' then btns[#btns + 1] = it end
 			end
-			local cell_w_px = ((1 / #cols) * out_w - gap_px) / pr
-			local maxw_b = cell_w_px / char_px
+			-- 先算列宽再求每行格数：'auto' 需要宽度才能判断能排在几个
+			local col_w_px = (1 / #cols) * out_w - gap_px
+			local pr = per_row_for(btns, col_w_px, char_px)
+			local maxw_b = (col_w_px / pr) / char_px
 			rows = rows + btn_rows_for(btns, pr, maxw_b)
 		end
 		col_rows[pl] = rows
@@ -1875,7 +1933,11 @@ local function draw_frame()
 			if it.kind == 'BUTTON' then btns[#btns + 1] = it end
 		end
 		if #btns > 0 then
-			local pr = per_row_for(#btns)
+			-- 与高度统计（draw_frame 里的 col_rows 循环）用【完全相同的表达式】
+			-- 求列宽，而不是 (x1-x0)*out_w —— 两者数学等价但浮点结果可能差最后几位，
+			-- 边界上会让 auto 在两处算出不同格数，导致行数算错、列间错位。
+			local col_w_px = (1 / n_cols) * out_w - gap_px
+			local pr = per_row_for(btns, col_w_px, char_px)
 			local cell_w = (x1 - x0) / pr
 			local maxw = (cell_w * out_w) / char_px
 			local i = 1
@@ -2292,18 +2354,18 @@ local function menu_callback(index, event)
 	elseif k == 'label' then
 		settings.label = (settings.label == 'ascii') and 'zh' or 'ascii'
 	elseif k == 'per_row' then
+		-- 档位循环：自动 → 1 → 2 → … → PER_ROW_MAX → 自动（左右都循环）
 		if dir == 0 then dir = 1 end
-		if settings.per_row == 'auto' then
-			settings.per_row = (dir > 0) and 1 or 3
-		else
-			local n = tonumber(settings.per_row) or 1
-			n = n + dir
-			if n < 1 or n > 3 then
-				settings.per_row = 'auto'
-			else
-				settings.per_row = n
-			end
+		local cycle = { 'auto' }
+		for i = 1, PER_ROW_MAX do cycle[#cycle + 1] = i end
+		local cur = tonumber(settings.per_row) or 'auto'
+		local idx = 1
+		for i = 1, #cycle do
+			if cycle[i] == cur then idx = i; break end
 		end
+		idx = idx + dir
+		if idx < 1 then idx = #cycle elseif idx > #cycle then idx = 1 end
+		settings.per_row = cycle[idx]
 	elseif k == 'show_start' then
 		settings.show_start = not settings.show_start
 	elseif k == 'seq_mode' then
