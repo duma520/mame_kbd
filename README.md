@@ -31,7 +31,7 @@
 - **版权**：永久
 - **日期**：永久
 - **邮箱**：不提供
-- **开源许可证**：MIT（适用于插件源代码；本文档文字部分的转载与商业使用限制见下方版权声明）
+- **开源许可证**：AGPL-3.0（适用于插件源代码；本文档文字与代码均以 AGPL-3.0 发布，允许转载与商业使用，无需另行授权））
 - **GitHub**：https://github.com/duma520
 - **网站**：https://github.com/duma520
 - **项目地址**：https://github.com/duma520/mame_kbd
@@ -1155,7 +1155,7 @@ $p | Wait-Process -Timeout 90
     本机 `SendInput` 被拒，真实高亮需手动按键确认。
 
 29. **文档能转载吗？**  
-    本文档文字未经书面许可不得转载或商用；代码按 MIT。
+    本文档文字与代码均以 AGPL-3.0 发布，允许转载与商业使用，无需另行授权。
 
 30. **怎么报问题？**  
     GitHub Issues：https://github.com/duma520/mame_kbd/issues
@@ -1220,7 +1220,7 @@ $p | Wait-Process -Timeout 90
 - **作者**：杜玛
 - **版权**：永久
 - **日期**：永久
-- **开源许可证**：MIT（插件源代码）
+- **开源许可证**：AGPL-3.0（插件源代码）
 - **GitHub**：https://github.com/duma520
 - **项目地址**：https://github.com/duma520/mame_kbd
 - **问题报告**：GitHub Issues
@@ -1236,3 +1236,12 @@ $p | Wait-Process -Timeout 90
 ---
 
 **文档结束**
+
+## 许可
+
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 发布。
+
+- 完整许可证条文见仓库根目录 [LICENSE](LICENSE)。
+- 你可以自由使用、修改、分发，包括用于商业用途，无需另行获得授权。
+- 若你修改后分发，或以网络服务方式提供本软件，必须按 AGPL-3.0 公开相应源代码。
+- 本仓库自 2026-11-23 起改用 AGPL-3.0；此前已按 MIT / BSD-3-Clause 发布的版本，其接收者依原许可证获得的授权继续有效。
