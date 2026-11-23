@@ -946,9 +946,9 @@ mock 必须按真实 API 语义造，不能只造“够用的最小集”。
 ## 12.6 UNC 路径取日志
 
 ```powershell
-net use Z: "\\Ds1821\hd" /persistent:no
+net use Z: "\\NAS\hd" /persistent:no
 $wd = 'Z:\ROM 街机\MAMEUI64 Plus!\mameui'
-$t  = 'G:\Python_Code\mame_kbd\scaffold\_runlog'
+$t  = '你的项目目录\mame_kbd\scaffold\_runlog'
 $p = Start-Process -FilePath "$wd\mameui.exe" `
   -ArgumentList @($rom,'-log','-verbose','-window','-seconds_to_run','6',
                  '-noreadconfig','-nowriteconfig',
